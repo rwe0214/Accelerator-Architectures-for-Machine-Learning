@@ -1,304 +1,410 @@
-#include <cublas_v2.h>
-#include <cuda.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <strings.h>
-#include <time.h>
-
+/* Includes, system */
+#include <cstdio>
 #include <iostream>
+#include <vector>
+#include <numeric>
+#include <chrono>
+#include <cstdio>
+#include <time.h>
+#include <stdio.h>
+/* Includes, cuda */
+#include <cuda_runtime.h>
+#include <cudnn.h>
+#include <cublas_v2.h>
+
+using namespace std;
 
 #define get_difftime_ms(t1, t2) ((float) (t2 - t1)) / CLOCKS_PER_SEC * 1000
-#define HEIGHT 224
-#define WIDTH 224
-#define CHANNEL 3
 
-cublasHandle_t cubHandle;
-// for cublas dummy constant
+cudnnHandle_t cudnn_handle;
+cublasHandle_t cublas_handle;
 const float alpha = 1.0f;
 const float beta = 0.0f;
 
-float *image;
-float *d_output;
-clock_t T;
-
-__global__ void maxpooling(float *output,
-                           const float *input,
-                           const int width,
-                           const int channels)
+struct Tensor4d
 {
-    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
-    // stride = 2, pool size = 2
-    int new_width = width / 2;
-    int i = thread_id / new_width * 2;
-    int j = thread_id % new_width * 2;
-    int index = i * width + j;
+    float *data;
+    int batch;
+    int channel;
+    int width;
+    int height;
+    size_t data_size;
+};
 
-    for (int c = 0; c < channels; c++) {
-        float max = 0;
-        if (max < input[index * channels + c])
-            max = input[index * channels + c];
-        if (max < input[(index + 1) * channels + c])
-            max = input[(index + 1) * channels + c];
-        if (max < input[(index + width) * channels + c])
-            max = input[(index + width) * channels + c];
-        if (max < input[(index + width + 1) * channels + c])
-            max = input[(index + width + 1) * channels + c];
-        output[thread_id * channels + c] = max;
+struct zeros
+{
+    float *data;
+    size_t data_size;
+    zeros(vector<int>dims)
+    {
+        data_size = accumulate(dims.begin(),
+                        dims.end(),
+                        1,
+                        multiplies<int>());
+        vector<float> host_data(data_size);
+        for(int i = 0; i < data_size; i++)
+            host_data[i] = 0;
+        
+        cudaMalloc((void**)&data,  data_size * sizeof(float));
+        cudaMemcpy(data, host_data.data(), data_size * sizeof(float), 
+		    cudaMemcpyHostToDevice);
     }
+    ~zeros()
+    {
+        cudaFree(data);
+    }
+};
+
+void set_Tensor4d(Tensor4d *ptr, int batch, int channel, int height, int width){
+    ptr->batch = batch;
+    ptr->channel = channel;
+    ptr->height = height;
+    ptr->width = width;
+    ptr->data_size = batch*channel*height*width;
+    ptr->data = (float *)malloc(ptr->data_size * sizeof(float));
+    srand(time(NULL));
+    for(int i = 0; i < ptr->data_size; i++)
+        ptr->data[i] = (float)(rand()%256);
 }
 
-__global__ void padding_image(float *input,
-                                const float *raw_input,
-                                const int width,
-                                const int channels)
-{
-    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
-    // 1 is padding size
-    int start_i = thread_id / width - 1;
-    int start_j = thread_id % width - 1;
-    int per_channel_width = width * width;
-    int hidden_width = 3 * 3 * channels + 1;
-    int global_offset = thread_id * hidden_width;
+Tensor4d Fully_connect(Tensor4d *input, int neuron, string layer_name){
+    auto exe_start = chrono::steady_clock::now();
+    int k = input->width * input->height * input->channel; 
+    float *x_data;
+    cudaMalloc((void**)&x_data, input->data_size * sizeof(float));
+    cudaMemcpy(x_data, input->data, input->data_size * sizeof(float), 
+        cudaMemcpyHostToDevice);
 
-    // 3 is filter size
-    for (int c = 0; c < channels; c++) {
-        int offset = 0;
-        for (int i = start_i; i < start_i + 3; i++) {
-            if (i < 0 || i == width)
-                continue;
-            for (int j = start_j; j < start_j + 3; j++) {
-                if (j < 0 || j == width)
-                    continue;
-                input[global_offset + c * 9 + offset] =
-                    raw_input[c * per_channel_width + i * width + j];
-                offset++;
-            }
-        }
+    float *w = (float *)malloc(k*neuron*sizeof(float));
+    for (int i = 0; i < neuron; i++) {
+        for (int j = 0; j < k; j++)
+            w[i * k + j] = (float) (rand() % 20);
     }
-    input[(thread_id + 1) * hidden_width - 1] = 1;
-}
+    float *w_data;
+    cudaMalloc((void**)&w_data, k*neuron*sizeof(float));
+    cudaMemcpy(w_data, w, k*neuron*sizeof(float), 
+        cudaMemcpyHostToDevice);
 
-__global__ void padding_fc(float *input,
-                             const float *raw_input,
-                             const int width,
-                             const int channels)
-{
-    int thread_id = threadIdx.x;
-    int size = width * width;
+    float *y_data;
+    cudaMalloc((void**)&y_data, input->batch*k*sizeof(float));
 
-    for (int s = 0; s < size; s++)
-        input[thread_id * size + s] = raw_input[s * channels + thread_id];
-    if (thread_id == 0)
-        input[width * width * channels] = 1;
-}
-
-__global__ void padding(float *input,
-                          const float *raw_input,
-                          const int width,
-                          const int channels)
-{
-    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
-    // 1 is padding size
-    int start_i = thread_id / width - 1;
-    int start_j = thread_id % width - 1;
-    int hidden_width = 3 * 3 * channels + 1;
-    int global_offset = thread_id * hidden_width;
-
-    float relu;
-    for (int c = 0; c < channels; c++) {
-        int offset = 0;
-        for (int i = start_i; i < start_i + 3; i++) {
-            if (i < 0 || i == width)
-                continue;
-            for (int j = start_j; j < start_j + 3; j++) {
-                offset++;
-                if (j < 0 || j == width)
-                    continue;
-                relu = raw_input[(i * width + j) * channels + c];
-                input[global_offset + c * 9 + offset] = relu < 0 ? 0 : relu;
-            }
-        }
-    }
-    input[(thread_id + 1) * hidden_width - 1] = 1;
-}
-
-void fully_connected(int width, int channels, int num_filters)
-{
-    int num_weights = (width * width * channels + 1) * num_filters;
-    int filter_size = width * width * channels;
-    int hidden_width = filter_size + 1;
-    float *weights = (float *) malloc(num_weights * sizeof(float));
-    for (int i = 0; i < num_filters; i++) {
-        for (int j = 0; j < filter_size; j++)
-            weights[i * hidden_width + j] = (float) (rand() % 20);
-        weights[i * hidden_width + filter_size] = (float) (rand() % 20);
-    }
-
-    float *d_input;
-    size_t input_size = (width * width * channels + 1) * sizeof(float);
-    clock_t t_start = clock();
-    cudaMalloc(&d_input, input_size);
-    if (width == 1) {
-        // previous output vector (channels * 1), expand to ((channels + 1) * 1)
-        // with a 1 at last
-        float *output = (float *) malloc((channels + 1) * sizeof(float));
-        cudaMemcpy(output, d_output, channels * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-        output[channels] = 1;
-        cudaMemcpy(d_input, output, (channels + 1) * sizeof(float),
-                   cudaMemcpyHostToDevice);
-        free(output);
-    } else {
-        // only the first fc needs to padding previous output to a vector
-        // (width * width * channels)
-        // padding, padding size is in padding* function
-        padding_fc<<<1, channels>>>(d_input, d_output, width, channels);
-        cudaDeviceSynchronize();
-    }
-
-    float *d_weights;
-    cudaMalloc(&d_weights, num_weights * sizeof(float));
-    cudaFree(d_output);
-    cudaMalloc(&d_output, num_filters * sizeof(float));
-    cublasSetMatrix(hidden_width, num_filters, sizeof(float), weights,
-                    hidden_width, d_weights, hidden_width);
-    // weights * input = (num_filters * (channels + 1)) * ((channels + 1) * 1),
-    // consider vector as matrix
-    cublasSgemm(cubHandle, CUBLAS_OP_N, CUBLAS_OP_N, 1, num_filters,
-                hidden_width, &alpha, d_input, 1, d_weights, hidden_width,
-                &beta, d_output, 1);
-
-    clock_t t_end = clock();
-    printf("FC%d\t\t%8.3f\t\t%8.3f\n", num_filters,
-           get_difftime_ms(t_start, t_end), get_difftime_ms(T, t_start));
-    free(weights);
-    cudaFree(d_input);
-    cudaFree(d_weights);
-}
-
-void maxpool(int width, int channels)
-{
-    float *d_temp;
-    size_t mem_size = width * width * channels * sizeof(float);
-    clock_t t_start = clock();
-    cudaMalloc(&d_temp, mem_size);
-    cudaMemcpy(d_temp, d_output, mem_size, cudaMemcpyDeviceToDevice);
-    cudaFree(d_output);
-    cudaMalloc(&d_output, mem_size / 4);
-    maxpooling<<<width / 2, width / 2>>>(d_output, d_temp, width, channels);
-
-    cudaDeviceSynchronize();
-    clock_t t_end = clock();
-    printf("MAXPOOL\t\t%8.3f\t\t%8.3f\n", get_difftime_ms(t_start, t_end),
-           get_difftime_ms(T, t_start));
-}
-
-/* 
- * input = (width * width)
- * filter = (3 * 3)
- * stride = 1
- * padding = 1
- * output = (width * width)
- */ 
-void convolution(int width, int channels, int num_filters)
-{
-    int num_weights = (3 * 3 * channels + 1) * num_filters;
-    int output_size = width * width * num_filters;
-    int filter_size = 3 * 3 * channels;
-    int hidden_width = 3 * 3 * channels + 1;
-    float *weights = (float *) malloc(num_weights * sizeof(float));
-    for (int i = 0; i < num_filters; i++) {
-        for (int j = 0; j < filter_size; j++)
-            weights[j * num_filters + i] = (float) (rand() % 20);
-        weights[filter_size * num_filters + i] = (float) (rand() % 20);
-    }
-
-    float *d_raw_input;
-    float *d_input;
-    size_t input_size = width * width * hidden_width * sizeof(float);
-    clock_t t_start = clock();
-    cudaMalloc(&d_input, input_size);
-    // zero padding
-    cudaMemset(d_input, 0, input_size);
-    // padding, padding size is in padding* function
-    if (channels == 3) {
-        size_t raw_input_size = width * width * channels * sizeof(float);
-        cudaMalloc(&d_raw_input, raw_input_size);
-        cudaMemcpy(d_raw_input, image, raw_input_size, cudaMemcpyHostToDevice);
-        padding_image<<<width, width>>>(d_input, d_raw_input, width,
-                                          channels);
-    } else
-        padding<<<width, width>>>(d_input, d_output, width, channels);
+    auto start = chrono::steady_clock::now();
+    cublasSgemm(cublas_handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            input->batch,
+            neuron,
+            k,
+            &alpha,
+            x_data,
+            k,
+            w_data,
+            k,
+            &beta,
+            y_data,
+            1);
     cudaDeviceSynchronize();
 
-    float *d_weights;
-    cudaMalloc(&d_weights, num_weights * sizeof(float));
-    cudaFree(d_output);
-    cudaMalloc(&d_output, output_size * sizeof(float));
-    cublasSetMatrix(num_filters, hidden_width, sizeof(float), weights,
-                    num_filters, d_weights, num_filters);
-    // input * weights = ((width * width) * (3 * 3 * channels + 1)) * ((3 * 3 *
-    // channels + 1) * num_filters)
-    cublasSgemm(cubHandle, CUBLAS_OP_N, CUBLAS_OP_N, num_filters, width * width,
-                hidden_width, &alpha, d_weights, num_filters, d_input,
-                hidden_width, &beta, d_output, num_filters);
+    auto end = chrono::steady_clock::now();
+    Tensor4d output;
+    output.data = (float *)malloc(input->batch*k*sizeof(float));
+    cudaMemcpy(output.data, y_data, input->batch*k*sizeof(float), 
+        cudaMemcpyDeviceToHost);
+    output.batch = 1;
+    output.channel = 1;
+    output.height = input->batch;
+    output.width = neuron;
 
-    clock_t t_end = clock();
-    printf("CONV\t\t%8.3f\t\t%8.3f\n", get_difftime_ms(t_start, t_end),
-           get_difftime_ms(T, t_start));
-    free(weights);
-    if (channels == 3)
-        cudaFree(d_raw_input);
-    cudaFree(d_input);
-    cudaFree(d_weights);
+    auto exe_end = chrono::steady_clock::now();
+    int exe_time = static_cast<int>(chrono::duration< double,
+                    micro>(exe_end - exe_start).count());
+    int fwd_time = static_cast<int>(chrono::duration< double,
+        micro>(end - start).count());
+    printf("%13s\t\t%8d\t\t%8d\n", layer_name.c_str(), exe_time, fwd_time);
+    cudaFree(x_data);
+    cudaFree(w_data);
+    cudaFree(y_data);
+    free(w);
+    free(input->data);
+    return output;
 }
 
-void create_image(int height, int width, int channel)
+Tensor4d maxpool(Tensor4d *input, int pool_size, int stride, string layer_name)
 {
-    int img_size = height * width * channel;
-    image = (float *) malloc(img_size * sizeof(float));
-    for (int i = 0; i < img_size; i++)
-        image[i] = (float) (rand() % 256);
+    auto exe_start = chrono::steady_clock::now();
+    cudnnTensorDescriptor_t x_desc;
+    void *x_data;
+    size_t data_size = input->batch * input->channel * input->height * input->width;
+    cudnnCreateTensorDescriptor(&x_desc);
+    cudnnSetTensor4dDescriptor(x_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        input->batch, input->channel, input->height, input->width);
+    cudaMalloc((void**)&x_data, data_size * sizeof(float));
+    cudaMemcpy(x_data, input->data, data_size * sizeof(float), 
+        cudaMemcpyHostToDevice);
+
+    int out_h, out_w, out_c, out_n;
+    vector<int> output_dims_;
+
+    cudnnPoolingDescriptor_t pooling_desc;
+    cudnnCreatePoolingDescriptor(&pooling_desc);
+    cudnnSetPooling2dDescriptor(pooling_desc, 
+                        /*mode=*/CUDNN_POOLING_MAX,
+                        /*maxpoolingNanOpt=*/CUDNN_NOT_PROPAGATE_NAN,
+                        /*windowHeight=*/pool_size,
+                        /*windowWidth=*/pool_size,
+                        /*verticalPadding=*/0,
+                        /*horizontalPadding=*/0,
+                        /*verticalStride=*/stride,
+                        /*horizontalStride=*/stride);
+    cudnnGetPooling2dForwardOutputDim(pooling_desc,
+                        x_desc,
+                        &out_n,
+                        &out_c,
+                        &out_h,
+                        &out_w);
+
+    cudnnTensorDescriptor_t y_desc;
+    void *y_data;
+    data_size = out_n * out_c * out_h * out_w;
+    cudnnCreateTensorDescriptor(&y_desc);
+    cudnnSetTensor4dDescriptor(y_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        out_n, out_c, out_h, out_w);
+    cudaMalloc((void**)&y_data, data_size * sizeof(float));
+    output_dims_ = {out_w, out_h, out_c, out_n};
+
+    auto start = chrono::steady_clock::now();
+    cudnnPoolingForward(cudnn_handle,
+                pooling_desc,
+                &alpha,
+                x_desc,
+                x_data,
+                &beta,
+                y_desc,
+                y_data);
+    cudaDeviceSynchronize();
+    auto end = chrono::steady_clock::now();
+    
+    Tensor4d output;
+    output.data = (float *)malloc(data_size * sizeof(float));
+    cudaMemcpy(output.data, y_data, data_size * sizeof(float), 
+        cudaMemcpyDeviceToHost);
+    output.batch = out_n;
+    output.channel = out_c;
+    output.height = out_h;
+    output.width = out_w;
+    output.data_size = out_n * out_c * out_h * out_w;
+
+    auto exe_end = chrono::steady_clock::now();
+    int exe_time = static_cast<int>(chrono::duration< double,
+                    micro>(exe_end - exe_start).count());
+    int fwd_time = static_cast<int>(chrono::duration< double,
+				    micro>(end - start).count());
+    
+    printf("%13s\t\t%8d\t\t%8d\n", layer_name.c_str(), exe_time, fwd_time);
+    cudnnDestroyPoolingDescriptor(pooling_desc);
+    cudaFree(x_data);
+    cudaFree(y_data);
+    cudnnDestroyTensorDescriptor(x_desc);
+    cudnnDestroyTensorDescriptor(y_desc);
+    free(input->data);
+    return output;
 }
+
+Tensor4d convolution(Tensor4d *input, int channels, int num_filters, string layer_name)
+{
+    auto exe_start = chrono::steady_clock::now();
+    cudnnTensorDescriptor_t x_desc;
+    void *x_data;
+    size_t data_size = input->batch * input->channel * input->height * input->width;
+    cudnnCreateTensorDescriptor(&x_desc);
+    cudnnSetTensor4dDescriptor(x_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        input->batch, input->channel, input->height, input->width);
+    cudaMalloc((void**)&x_data, data_size * sizeof(float));
+    cudaMemcpy(x_data, input->data, data_size * sizeof(float), 
+        cudaMemcpyHostToDevice);
+
+    cudnnFilterDescriptor_t w_desc;
+    void *w_data;
+    data_size = num_filters * channels * 3 * 3;
+    cudnnCreateFilterDescriptor(&w_desc);
+    cudnnSetFilter4dDescriptor(w_desc,
+        CUDNN_DATA_FLOAT,
+        CUDNN_TENSOR_NCHW,
+        num_filters, channels, 3, 3);
+    cudaMalloc((void**)&w_data, data_size * sizeof(float));
+    vector<float> random_filter(data_size);
+    for(int i = 0; i < data_size; i++)
+        random_filter[i] = 0;
+    cudaMemcpy(w_data, random_filter.data(), data_size * sizeof(float), 
+        cudaMemcpyHostToDevice);
+    
+
+    int out_h, out_w, out_c, out_n;
+    vector<int> output_dims_;
+
+    cudnnConvolutionDescriptor_t conv_desc;
+    cudnnCreateConvolutionDescriptor(&conv_desc);
+    cudnnSetConvolution2dDescriptor( conv_desc,
+                        /*pad_height=*/1,
+                        /*pad_width=*/1,
+                        /*vertical_stride=*/1,
+                        /*horizontal_stride=*/1,
+                        /*dilation_height=*/1,
+                        /*dilation_width=*/1,
+                        /*mode=*/CUDNN_CONVOLUTION,
+                        /*computeType=*/CUDNN_DATA_FLOAT);
+    cudnnGetConvolution2dForwardOutputDim( conv_desc,
+                        x_desc,
+                        w_desc,
+                        &out_n,
+                        &out_c,
+                        &out_h,
+                        &out_w);
+
+    cudnnTensorDescriptor_t y_desc;
+    void *y_data;
+    data_size = out_n * out_c * out_h * out_w;
+    cudnnCreateTensorDescriptor(&y_desc);
+    cudnnSetTensor4dDescriptor(y_desc,
+        CUDNN_TENSOR_NCHW,
+        CUDNN_DATA_FLOAT,
+        out_n, out_c, out_h, out_w);
+    cudaMalloc((void**)&y_data, data_size * sizeof(float));
+
+    const int requestAlgoCount = 1;
+    int returnedAlgoCount;
+    cudnnConvolutionFwdAlgoPerf_t perfResults;
+
+    cudnnFindConvolutionForwardAlgorithm( cudnn_handle,
+                        x_desc,
+                        w_desc,
+                        conv_desc,
+                        y_desc,
+                        requestAlgoCount,
+                        &returnedAlgoCount,
+                        &perfResults);
+    cudnnConvolutionFwdAlgo_t fwd_algo = perfResults.algo;
+    size_t fwd_workspace_size = 0;
+    cudnnGetConvolutionForwardWorkspaceSize( cudnn_handle,
+                        x_desc,
+                        w_desc,
+                        conv_desc,
+                        y_desc,
+                        fwd_algo,
+                        &fwd_workspace_size);
+                       
+    vector<int> u = vector<int>{static_cast<int>
+                        (fwd_workspace_size / sizeof(float)), 1};
+    zeros fwd_workspace(u);
+
+
+    auto start = chrono::steady_clock::now();
+
+   // fwd conv
+   cudnnStatus_t s = cudnnConvolutionForward(cudnn_handle,
+                        &alpha,
+                        x_desc,
+                        x_data,
+                        w_desc,
+                        w_data,
+                        conv_desc,
+                        fwd_algo,
+                        fwd_workspace.data,
+                        fwd_workspace_size,
+                        &beta,
+                        y_desc,
+                        y_data); 
+    cudaDeviceSynchronize();
+    
+    cudnnActivationDescriptor_t activate_desc;
+    cudnnCreateActivationDescriptor(&activate_desc);
+    cudnnSetActivationDescriptor(activate_desc,
+                        CUDNN_ACTIVATION_RELU,
+                        CUDNN_NOT_PROPAGATE_NAN,
+                        0.0);
+    cudnnActivationForward(cudnn_handle,
+                        activate_desc,
+                        &alpha,
+                        y_desc,
+                        y_data,
+                        &beta,
+                        y_desc,
+                        y_data);
+    cudaDeviceSynchronize();
+    auto end = chrono::steady_clock::now();
+
+    Tensor4d output;
+    output.data = (float *)malloc(data_size * sizeof(float));
+    cudaMemcpy(output.data, y_data, data_size * sizeof(float), 
+        cudaMemcpyDeviceToHost);
+    output.batch = out_n;
+    output.channel = out_c;
+    output.height = out_h;
+    output.width = out_w;
+    output.data_size = out_n * out_c * out_h * out_w;
+
+    auto exe_end = chrono::steady_clock::now();
+    int exe_time = static_cast<int>(chrono::duration< double,
+                    micro>(exe_end - exe_start).count());
+    int fwd_time = static_cast<int>(chrono::duration< double,
+				    micro>(end - start).count());
+    printf("%13s\t\t%8d\t\t%8d\n", layer_name.c_str(), exe_time, fwd_time);
+
+    // destroy conv desc
+    cudnnDestroyConvolutionDescriptor(conv_desc);
+    cudnnDestroyActivationDescriptor(activate_desc);
+    cudaFree(x_data);
+    cudaFree(w_data);
+    cudaFree(y_data);
+    cudnnDestroyTensorDescriptor(x_desc);
+    cudnnDestroyTensorDescriptor(y_desc);
+    cudnnDestroyFilterDescriptor(w_desc);
+    free(input->data);
+    return output;
+}
+
 
 int main()
 {
-    srand(time(NULL));
-    create_image(HEIGHT, WIDTH, CHANNEL);
+    cudnnCreate(&cudnn_handle);
+    cublasCreate(&cublas_handle);
+    Tensor4d input, output;
+    set_Tensor4d(&input, 1, 3, 224, 224);
 
-    cublasCreate(&cubHandle);
+    printf("\t\tExecution time(ms)\tConv Forward Algo.\n");
 
-    // ReLU layers in padding kernel or maxpooling
-    printf("\t   Execution time(ms)    Conv Forward Algo.\n");
-    T = clock();
-    convolution(224, 3, 64);
-    convolution(224, 64, 64);
-    maxpool(224, 64);
+    output = convolution(&input, 3, 64, "conv1_1");
+    output = convolution(&output, 64, 64, "conv1_2");
+    output = maxpool(&output, 2, 2, "max_pooling_1");
 
-    convolution(112, 64, 128);
-    convolution(112, 128, 128);
-    maxpool(112, 128);
+    output = convolution(&output, 64, 128, "conv2_1");
+    output = convolution(&output, 128, 128, "conv2_2");
+    output = maxpool(&output, 2, 2, "max_pooling_2");
 
-    convolution(56, 128, 256);
-    convolution(56, 256, 256);
-    convolution(56, 256, 256);
-    maxpool(56, 256);
+    output = convolution(&output, 128, 256, "conv3_1");
+    output = convolution(&output, 256, 256, "conv3_2");
+    output = convolution(&output, 256, 256, "conv3_3");
+    output = maxpool(&output, 2, 2, "max_pooling_3");
 
-    convolution(28, 256, 512);
-    convolution(28, 512, 512);
-    convolution(28, 512, 512);
-    maxpool(28, 512);
+    output = convolution(&output, 256, 512, "conv4_1");
+    output = convolution(&output, 512, 512, "conv4_2");
+    output = convolution(&output, 512, 512, "conv4_3");
+    output = maxpool(&output, 2, 2, "max_pooling_4");
 
-    convolution(14, 512, 512);
-    convolution(14, 512, 512);
-    convolution(14, 512, 512);
-    maxpool(14, 512);
+    output = convolution(&output, 512, 512, "conv5_1");
+    output = convolution(&output, 512, 512, "conv5_2");
+    output = convolution(&output, 512, 512, "conv5_3");
+    output = maxpool(&output, 2, 2, "max_pooling_5");
+    output = Fully_connect(&output, 4096, "FC_4096");
+    output = Fully_connect(&output, 4096, "FC_4096");
+    output = Fully_connect(&output, 1000, "FC_1000");
 
-    fully_connected(7, 512, 4096);
-    fully_connected(1, 4096, 4096);
-    fully_connected(1, 4096, 1000);
-
-    cublasDestroy(cubHandle);
-    free(image);
-    return 0;
+    cublasDestroy(cublas_handle);
+    cudnnDestroy(cudnn_handle);
 }

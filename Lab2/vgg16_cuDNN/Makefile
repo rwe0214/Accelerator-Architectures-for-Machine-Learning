@@ -4,12 +4,12 @@ ARCH = -arch=sm_70
 EXE = vgg16
 SRCDIR = .
 
-SRCS = $(wildcard $(SRCDIR)/*.cu)
+SRCS = vgg16_cuDNN.cu
 
 all: $(EXE)
 
 $(EXE): $(SRCS)
-	$(NVCC) $(ARCH) -o $@ $? $(LDFLAGS)
+	$(NVCC) -g $(ARCH) -o $@ $? $(LDFLAGS)
 
 run:
 	@./$(EXE)
