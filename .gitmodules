@@ -1,6 +1,6 @@
 [submodule "Lab1/vgg16_forward"]
 	path = Lab1/vgg16_forward
-	url = https://github.com/rwe0214/googLeNet.git
+	url = https://github.com/rwe0214/vgg16_forward.git
 [submodule "Lab1/googLeNet"]
 	path = Lab1/googLeNet
-	url = https://github.com/rwe0214/vgg16_forward.git
+	url = https://github.com/rwe0214/googLeNet.git
